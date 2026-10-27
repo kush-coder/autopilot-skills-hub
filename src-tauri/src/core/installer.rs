@@ -1,0 +1,2644 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use anyhow::{Context, Result};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::cache_cleanup::get_git_cache_ttl_secs;
+use super::cancel_token::CancelToken;
+use super::central_repo::{ensure_central_repo, resolve_central_repo_path};
+use super::content_hash::{hash_dir, hash_dir_for_sync_conflict, hash_dir_strict};
+use super::git_fetcher::{clone_or_pull, clone_or_pull_sparse};
+use super::github_download::{
+    download_github_directory, parse_github_api_params, GithubDownloadOptions,
+};
+use super::github_token::{resolve_github_token, SystemGithubTokenStore};
+use super::network_proxy::get_github_proxy_url;
+use super::runtime_paths::RuntimePaths;
+use super::skill_store::{SkillRecord, SkillStore, SkillTargetRecord};
+use super::sync_engine::{
+    copy_dir_recursive, sync_dir_for_tool_with_overwrite, PreparedDirReplacement, SyncMode,
+};
+use super::tool_adapters::{
+    adapter_by_key, project_relative_skills_dir, resolve_adapter_path_in_home, ToolId,
+};
+
+pub const OFFICIAL_SKILL_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../skills/manage-skills-hub/SKILL.md"
+));
+
+pub struct InstallResult {
+    pub skill_id: String,
+    pub name: String,
+    pub central_path: PathBuf,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BatchImportCandidate {
+    pub name: String,
+    pub source_path: PathBuf,
+    pub target_path: PathBuf,
+    pub expected_content_hash: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct AdoptPlanStaleError;
+
+impl std::fmt::Display for AdoptPlanStaleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("adopt plan state changed")
+    }
+}
+
+impl std::error::Error for AdoptPlanStaleError {}
+
+fn adopt_plan_stale<T>() -> Result<T> {
+    Err(AdoptPlanStaleError.into())
+}
+
+fn validate_adopt_source_stat(result: std::io::Result<std::fs::Metadata>) -> Result<()> {
+    match result {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => adopt_plan_stale(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => adopt_plan_stale(),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_adopt_manifest_stat(result: std::io::Result<std::fs::Metadata>) -> Result<()> {
+    match result {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => adopt_plan_stale(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => adopt_plan_stale(),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn validate_adopt_target_stat(result: std::io::Result<std::fs::Metadata>) -> Result<()> {
+    match result {
+        Ok(_) => adopt_plan_stale(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn canonicalize_adopt_source(path: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => adopt_plan_stale(),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn error_is_already_exists(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+    })
+}
+
+pub(crate) fn validate_skill_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    let one_normal_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    let device_base = name.split('.').next().unwrap_or(name);
+    let windows_device = matches!(
+        device_base.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    anyhow::ensure!(
+        !name.trim().is_empty()
+            && name.trim() == name
+            && one_normal_component
+            && !name.contains('/')
+            && !name.contains('\\')
+            && !name.chars().any(|character| character.is_control()
+                || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+            && !name.ends_with(['.', ' '])
+            && !windows_device
+            && name != "."
+            && name != "..",
+        "skill name must be a safe single file name"
+    );
+    Ok(())
+}
+
+pub(crate) fn import_existing_local_skills_batch(
+    store: &SkillStore,
+    candidates: &[BatchImportCandidate],
+) -> Result<Vec<InstallResult>> {
+    let mut seen_targets = HashSet::new();
+    let now = now_ms();
+    let mut records = Vec::with_capacity(candidates.len());
+    let mut replacements = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        validate_skill_name(&candidate.name)?;
+        let source = canonicalize_adopt_source(&candidate.source_path)?;
+        validate_adopt_source_stat(std::fs::symlink_metadata(&candidate.source_path))?;
+        validate_adopt_manifest_stat(std::fs::symlink_metadata(source.join("SKILL.md")))?;
+        anyhow::ensure!(
+            seen_targets.insert(candidate.target_path.clone()),
+            "duplicate adopt target"
+        );
+        validate_adopt_target_stat(std::fs::symlink_metadata(&candidate.target_path))?;
+        let replacement =
+            match PreparedDirReplacement::prepare_copy(&source, &candidate.target_path, None, true)
+            {
+                Ok(replacement) => replacement,
+                Err(error) if error_is_not_found(&error) => return adopt_plan_stale(),
+                Err(error) => return Err(error),
+            };
+        validate_adopt_source_stat(std::fs::symlink_metadata(&candidate.source_path))?;
+        anyhow::ensure!(
+            canonicalize_adopt_source(&candidate.source_path)? == source,
+            AdoptPlanStaleError
+        );
+        validate_adopt_manifest_stat(std::fs::symlink_metadata(source.join("SKILL.md")))?;
+        if replacement.staged_content_hash()? != candidate.expected_content_hash {
+            return adopt_plan_stale();
+        }
+        let content_hash = Some(candidate.expected_content_hash.clone());
+        records.push(SkillRecord {
+            id: Uuid::new_v4().to_string(),
+            name: candidate.name.clone(),
+            description: parse_skill_md(&source.join("SKILL.md")).and_then(|(_, value)| value),
+            source_type: "local".to_string(),
+            source_ref: Some(source.to_string_lossy().into_owned()),
+            source_subpath: None,
+            source_revision: None,
+            central_path: candidate.target_path.to_string_lossy().into_owned(),
+            content_hash,
+            created_at: now,
+            updated_at: now,
+            last_sync_at: None,
+            last_seen_at: now,
+            enabled: true,
+            status: "ok".to_string(),
+        });
+        replacements.push(replacement);
+    }
+
+    for index in 0..replacements.len() {
+        if let Err(error) = replacements[index].activate_missing_only() {
+            for replacement in replacements.iter_mut().take(index).rev() {
+                let _ = replacement.rollback();
+            }
+            return if error_is_already_exists(&error) {
+                adopt_plan_stale()
+            } else {
+                Err(error)
+            };
+        }
+    }
+    if let Err(error) = store.commit_skill_updates(&records) {
+        let mut rollback_error = None;
+        for replacement in replacements.iter_mut().rev() {
+            if let Err(error) = replacement.rollback() {
+                rollback_error = Some(error);
+            }
+        }
+        if let Some(rollback_error) = rollback_error {
+            return Err(rollback_error).context("adopt database commit and rollback failed");
+        }
+        return Err(error).context("commit adopted skills");
+    }
+    for replacement in &mut replacements {
+        replacement.commit();
+    }
+    Ok(records
+        .into_iter()
+        .map(|record| InstallResult {
+            skill_id: record.id,
+            name: record.name,
+            central_path: PathBuf::from(record.central_path),
+            content_hash: record.content_hash,
+        })
+        .collect())
+}
+
+#[derive(Debug)]
+pub(crate) struct SkillAlreadyExistsError {
+    central_path: PathBuf,
+}
+
+impl SkillAlreadyExistsError {
+    fn new(central_path: PathBuf) -> Self {
+        Self { central_path }
+    }
+
+    pub(crate) fn central_path(&self) -> &Path {
+        &self.central_path
+    }
+}
+
+impl std::fmt::Display for SkillAlreadyExistsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("skill already exists in central repo")
+    }
+}
+
+impl std::error::Error for SkillAlreadyExistsError {}
+
+fn record_target_sync_failure(
+    store: &SkillStore,
+    target: &SkillTargetRecord,
+    error: &str,
+) -> Result<()> {
+    let mut failed_target = target.clone();
+    failed_target.status = "error".to_string();
+    failed_target.last_error = Some(error.to_string());
+    store.upsert_skill_target(&failed_target)
+}
+
+pub fn install_local_skill(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    source_path: &Path,
+    name: Option<String>,
+) -> Result<InstallResult> {
+    install_local_skill_with_existing_policy(paths, store, source_path, name, false)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn import_existing_local_skill(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    source_path: &Path,
+    name: Option<String>,
+) -> Result<InstallResult> {
+    install_local_skill_with_existing_policy(paths, store, source_path, name, true)
+}
+
+fn install_local_skill_with_existing_policy(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    source_path: &Path,
+    name: Option<String>,
+    reuse_identical_existing: bool,
+) -> Result<InstallResult> {
+    if !source_path.exists() {
+        anyhow::bail!("source path not found: {:?}", source_path);
+    }
+
+    let name = name.unwrap_or_else(|| {
+        source_path
+            .file_name()
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed-skill".to_string())
+    });
+
+    let central_dir = resolve_central_repo_path(paths, store)?;
+    ensure_central_repo(&central_dir)?;
+    let central_path = central_dir.join(&name);
+
+    if central_path.exists() {
+        if reuse_identical_existing {
+            let existing = store
+                .list_skills()?
+                .into_iter()
+                .find(|skill| Path::new(&skill.central_path) == central_path);
+            let source_hash = hash_dir(source_path).ok();
+            let central_hash = hash_dir(&central_path).ok();
+            if let (Some(record), Some(src_hash), Some(dst_hash)) =
+                (existing, source_hash, central_hash)
+            {
+                if src_hash == dst_hash {
+                    return Ok(InstallResult {
+                        skill_id: record.id,
+                        name: record.name,
+                        central_path,
+                        content_hash: record.content_hash,
+                    });
+                }
+            }
+        }
+        return Err(SkillAlreadyExistsError::new(central_path).into());
+    }
+
+    copy_dir_recursive(source_path, &central_path)
+        .with_context(|| format!("copy {:?} -> {:?}", source_path, central_path))?;
+
+    let now = now_ms();
+    let content_hash = compute_content_hash(&central_path);
+    let description = parse_skill_md(&central_path.join("SKILL.md")).and_then(|(_, desc)| desc);
+
+    let record = SkillRecord {
+        id: Uuid::new_v4().to_string(),
+        name,
+        description,
+        source_type: "local".to_string(),
+        source_ref: Some(source_path.to_string_lossy().to_string()),
+        source_subpath: None,
+        source_revision: None,
+        central_path: central_path.to_string_lossy().to_string(),
+        content_hash: content_hash.clone(),
+        created_at: now,
+        updated_at: now,
+        last_sync_at: None,
+        last_seen_at: now,
+        enabled: true,
+        status: "ok".to_string(),
+    };
+
+    store.commit_skill_update(&record, &[])?;
+
+    Ok(InstallResult {
+        skill_id: record.id,
+        name: record.name,
+        central_path,
+        content_hash,
+    })
+}
+
+pub fn install_git_skill(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    repo_url: &str,
+    name: Option<String>,
+    cancel: Option<&CancelToken>,
+) -> Result<InstallResult> {
+    let parsed = parse_github_url(repo_url);
+    let user_provided_name = name.is_some();
+    let mut name = name.unwrap_or_else(|| {
+        if let Some(subpath) = &parsed.subpath {
+            if subpath == "." {
+                derive_name_from_repo_url(&parsed.clone_url)
+            } else {
+                subpath
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| derive_name_from_repo_url(&parsed.clone_url))
+            }
+        } else {
+            derive_name_from_repo_url(&parsed.clone_url)
+        }
+    });
+
+    let central_dir = resolve_central_repo_path(paths, store)?;
+    ensure_central_repo(&central_dir)?;
+    let mut central_path = central_dir.join(&name);
+
+    if central_path.exists() {
+        return Err(SkillAlreadyExistsError::new(central_path).into());
+    }
+
+    // Fast path: for subpath installs, prefer sparse git checkout.
+    // The old GitHub Contents API path is much slower on large repos because it performs
+    // one directory/file request at a time and can time out before we even attempt git.
+    let github_proxy_url = get_github_proxy_url(store)?;
+    let revision;
+    if let Some((owner, repo, branch, subpath)) = parse_github_api_params(
+        &parsed.clone_url,
+        parsed.branch.as_deref(),
+        parsed.subpath.as_deref(),
+    ) {
+        log::info!(
+            "[installer] using sparse git checkout for subpath install: {}/{} path={}",
+            owner,
+            repo,
+            subpath
+        );
+        match clone_to_cache_subpath(
+            paths,
+            store,
+            &parsed.clone_url,
+            Some(branch.as_str()),
+            &subpath,
+            cancel,
+        ) {
+            Ok((repo_dir, rev)) => {
+                let sub_src = repo_dir.join(&subpath);
+                if !sub_src.exists() {
+                    anyhow::bail!("subpath not found in repo: {:?}", sub_src);
+                }
+                ensure_installable_skill_dir(&sub_src)?;
+                copy_dir_recursive(&sub_src, &central_path)
+                    .with_context(|| format!("copy {:?} -> {:?}", sub_src, central_path))?;
+                revision = rev;
+            }
+            Err(err) => {
+                // Clean up partial content before fallback.
+                let _ = std::fs::remove_dir_all(&central_path);
+                let err_msg = format!("{:#}", err);
+                if err_msg.contains("CANCELLED|") {
+                    return Err(err);
+                }
+                log::warn!(
+                    "[installer] sparse git checkout failed, falling back to GitHub API download: {:#}",
+                    err
+                );
+                let github_token = resolve_github_token(store, &SystemGithubTokenStore)?;
+                match download_github_directory(
+                    &owner,
+                    &repo,
+                    &branch,
+                    &subpath,
+                    &central_path,
+                    GithubDownloadOptions {
+                        cancel,
+                        token: github_token.as_deref(),
+                        proxy_url: &github_proxy_url,
+                    },
+                ) {
+                    Ok(()) => {
+                        revision = format!("api-download-{}", branch);
+                    }
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(&central_path);
+                        let err_msg = format!("{:#}", err);
+                        if err_msg.contains("CANCELLED|") {
+                            return Err(err);
+                        }
+                        if err_msg.contains("404") || err_msg.contains("Not Found") {
+                            anyhow::bail!(
+                                "该 Skill 在 GitHub 上未找到（可能已被删除或路径已变更）。\n请检查链接是否正确：{}/tree/{}/{}",
+                                parsed.clone_url.trim_end_matches(".git"),
+                                branch,
+                                subpath
+                            );
+                        }
+                        if let Some(rest) = err_msg.strip_prefix("RATE_LIMITED|") {
+                            let mins: i64 = rest.trim().parse().unwrap_or(0);
+                            if mins > 0 {
+                                anyhow::bail!(
+                                    "GitHub API 频率限制已触发，约 {} 分钟后重置。可在设置中配置 GitHub Token 以提升限额。",
+                                    mins
+                                );
+                            }
+                            anyhow::bail!(
+                                "GitHub API 频率限制已触发。可在设置中配置 GitHub Token 以提升限额。"
+                            );
+                        }
+                        if err_msg.contains("403") || err_msg.contains("Forbidden") {
+                            anyhow::bail!(
+                                "GitHub API 访问被拒绝（可能触发了频率限制）。请稍后再试。"
+                            );
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    } else {
+        // Standard git clone path (no subpath or non-GitHub URL)
+        let (repo_dir, rev) = clone_to_cache(
+            paths,
+            store,
+            &parsed.clone_url,
+            parsed.branch.as_deref(),
+            cancel,
+        )?;
+
+        let copy_src = if let Some(subpath) = &parsed.subpath {
+            let sub_src = repo_dir.join(subpath);
+            if !sub_src.exists() {
+                anyhow::bail!("subpath not found in repo: {:?}", sub_src);
+            }
+            ensure_installable_skill_dir(&sub_src)?;
+            sub_src
+        } else {
+            // Repo root URL: detect multi-skill repos and ask user to pick one.
+            let skill_count = count_skills_in_repo(&repo_dir);
+            if skill_count >= 2 {
+                anyhow::bail!(
+                    "MULTI_SKILLS|该仓库包含多个 Skills，请复制具体 Skill 文件夹链接（例如 GitHub 的 /tree/<branch>/<skill-folder>），再导入。"
+                );
+            }
+            ensure_installable_skill_dir(&repo_dir)?;
+            repo_dir.clone()
+        };
+
+        copy_dir_recursive(&copy_src, &central_path)
+            .with_context(|| format!("copy {:?} -> {:?}", copy_src, central_path))?;
+        revision = rev;
+    }
+    // After download, prefer the name from SKILL.md over the derived name (fixes #28:
+    // when subpath is "skills", the derived name collides with tool directory names).
+    let (mut description, md_name) = match parse_skill_md(&central_path.join("SKILL.md")) {
+        Some((n, d)) => (d, Some(n)),
+        None => (None, None),
+    };
+    if !user_provided_name {
+        if let Some(ref better_name) = md_name {
+            if *better_name != name {
+                let new_central = central_dir.join(better_name);
+                if !new_central.exists() {
+                    std::fs::rename(&central_path, &new_central).with_context(|| {
+                        format!("rename {:?} -> {:?}", central_path, new_central)
+                    })?;
+                    name = better_name.clone();
+                    central_path = new_central;
+                }
+                // Re-read description after rename (path changed)
+                description = parse_skill_md(&central_path.join("SKILL.md")).and_then(|(_, d)| d);
+            }
+        }
+    }
+
+    let now = now_ms();
+    let content_hash = compute_content_hash(&central_path);
+
+    let record = SkillRecord {
+        id: Uuid::new_v4().to_string(),
+        name,
+        description,
+        source_type: "git".to_string(),
+        source_ref: Some(repo_url.to_string()),
+        source_subpath: parsed.subpath.clone(),
+        source_revision: Some(revision),
+        central_path: central_path.to_string_lossy().to_string(),
+        content_hash: content_hash.clone(),
+        created_at: now,
+        updated_at: now,
+        last_sync_at: None,
+        last_seen_at: now,
+        enabled: true,
+        status: "ok".to_string(),
+    };
+
+    store.commit_skill_update(&record, &[])?;
+
+    Ok(InstallResult {
+        skill_id: record.id,
+        name: record.name,
+        central_path,
+        content_hash,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ParsedGitSource {
+    clone_url: String,
+    branch: Option<String>,
+    subpath: Option<String>,
+}
+
+fn parse_github_url(input: &str) -> ParsedGitSource {
+    // Supports:
+    // - https://github.com/owner/repo
+    // - https://github.com/owner/repo.git
+    // - https://github.com/owner/repo/tree/<branch>/<path>
+    // - https://github.com/owner/repo/blob/<branch>/<path>
+    let trimmed = input.trim().trim_end_matches('/');
+
+    // Convenience: allow GitHub shorthand inputs like `owner/repo` (and `owner/repo/tree/<branch>/...`).
+    // This keeps the UI friendly while still allowing local paths or other git remotes.
+    let normalized = if trimmed.starts_with("https://github.com/") {
+        trimmed.to_string()
+    } else if trimmed.starts_with("http://github.com/") {
+        trimmed.replacen("http://github.com/", "https://github.com/", 1)
+    } else if trimmed.starts_with("github.com/") {
+        format!("https://{}", trimmed)
+    } else if looks_like_github_shorthand(trimmed) {
+        format!("https://github.com/{}", trimmed)
+    } else {
+        trimmed.to_string()
+    };
+
+    let trimmed = normalized.trim_end_matches('/');
+    let gh_prefix = "https://github.com/";
+    if !trimmed.starts_with(gh_prefix) {
+        return ParsedGitSource {
+            clone_url: trimmed.to_string(),
+            branch: None,
+            subpath: None,
+        };
+    }
+
+    let rest = &trimmed[gh_prefix.len()..];
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 2 {
+        return ParsedGitSource {
+            clone_url: trimmed.to_string(),
+            branch: None,
+            subpath: None,
+        };
+    }
+
+    let owner = parts[0];
+    let mut repo = parts[1].to_string();
+    if let Some(stripped) = repo.strip_suffix(".git") {
+        repo = stripped.to_string();
+    }
+    let clone_url = format!("https://github.com/{}/{}.git", owner, repo);
+
+    if parts.len() >= 4 && (parts[2] == "tree" || parts[2] == "blob") {
+        let branch = Some(parts[3].to_string());
+        let subpath = if parts.len() > 4 {
+            Some(normalize_github_skill_subpath(&parts[4..].join("/")))
+        } else {
+            None
+        };
+        return ParsedGitSource {
+            clone_url,
+            branch,
+            subpath,
+        };
+    }
+
+    ParsedGitSource {
+        clone_url,
+        branch: None,
+        subpath: None,
+    }
+}
+
+pub(crate) fn same_git_skill_source(
+    source: &str,
+    source_subpath: Option<&str>,
+    reference: &str,
+    subpath: &str,
+) -> bool {
+    same_git_source(source, source_subpath, reference, subpath, true)
+}
+
+pub(crate) fn same_collection_skill_source(
+    source: &str,
+    source_subpath: Option<&str>,
+    reference: &str,
+    subpath: &str,
+) -> bool {
+    same_git_source(source, source_subpath, reference, subpath, false)
+}
+
+fn same_git_source(
+    source: &str,
+    source_subpath: Option<&str>,
+    reference: &str,
+    subpath: &str,
+    compare_revision: bool,
+) -> bool {
+    fn identity(reference: &str) -> ParsedGitSource {
+        let reference = reference.trim();
+        let normalized = reference
+            .strip_prefix("git@github.com:")
+            .or_else(|| reference.strip_prefix("ssh://git@github.com/"))
+            .map(|path| format!("https://github.com/{path}"));
+        let mut parsed = parse_github_url(normalized.as_deref().unwrap_or(reference));
+        if parsed.clone_url.starts_with("https://github.com/") {
+            parsed.clone_url = parsed.clone_url.to_ascii_lowercase();
+        }
+        parsed
+    }
+    let source = identity(source);
+    let requested = identity(reference);
+    let stored_path = source_subpath.or(source.subpath.as_deref()).unwrap_or(".");
+    source.clone_url == requested.clone_url
+        && (!compare_revision || source.branch == requested.branch)
+        && Path::new(stored_path) == Path::new(subpath)
+}
+
+fn normalize_github_skill_subpath(subpath: &str) -> String {
+    let trimmed = subpath.trim_matches('/');
+    if trimmed.eq_ignore_ascii_case("SKILL.md") {
+        return ".".to_string();
+    }
+    trimmed
+        .strip_suffix("/SKILL.md")
+        .or_else(|| trimmed.strip_suffix("/skill.md"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn looks_like_github_shorthand(input: &str) -> bool {
+    if input.is_empty() {
+        return false;
+    }
+    if input.starts_with('/') || input.starts_with('~') || input.starts_with('.') {
+        return false;
+    }
+    // Avoid scp-like ssh URLs (git@github.com:owner/repo) and any explicit schemes.
+    if input.contains("://") || input.contains('@') || input.contains(':') {
+        return false;
+    }
+
+    let parts: Vec<&str> = input.split('/').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+
+    let owner = parts[0];
+    let repo = parts[1];
+    if owner.is_empty()
+        || repo.is_empty()
+        || owner == "."
+        || owner == ".."
+        || repo == "."
+        || repo == ".."
+    {
+        return false;
+    }
+
+    let is_safe_segment = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    };
+    if !is_safe_segment(owner) || !is_safe_segment(repo.trim_end_matches(".git")) {
+        return false;
+    }
+
+    // If there are more path parts, only accept the GitHub UI patterns we can parse.
+    if parts.len() > 2 {
+        matches!(parts[2], "tree" | "blob")
+    } else {
+        true
+    }
+}
+
+fn now_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() as i64
+}
+
+fn derive_name_from_repo_url(repo_url: &str) -> String {
+    let mut name = repo_url
+        .split('/')
+        .next_back()
+        .unwrap_or("skill")
+        .to_string();
+    if let Some(stripped) = name.strip_suffix(".git") {
+        name = stripped.to_string();
+    }
+    if name.is_empty() {
+        "skill".to_string()
+    } else {
+        name
+    }
+}
+
+/// Scan base directories used for skill discovery.
+const SKILL_SCAN_BASES: [&str; 5] = [
+    "skills",
+    "skills/.curated",
+    "skills/.experimental",
+    "skills/.system",
+    ".claude/skills",
+];
+
+/// Check if a directory is a valid skill (has SKILL.md or is under .claude/skills/).
+fn is_skill_dir(p: &Path) -> bool {
+    p.is_dir() && (p.join("SKILL.md").exists() || is_claude_skill_dir(p))
+}
+
+fn ensure_installable_skill_dir(p: &Path) -> Result<()> {
+    if is_skill_dir(p) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "SKILL_INVALID|missing_skill_md|该路径不是有效 Skill 目录：未找到 SKILL.md。请粘贴具体 Skill 文件夹链接。"
+        );
+    }
+}
+
+/// Check if a directory is a Claude plugin skill (under .claude/skills/ without SKILL.md).
+fn is_claude_skill_dir(p: &Path) -> bool {
+    // A directory under .claude/skills/ is treated as a valid skill even without SKILL.md
+    if let Some(parent) = p.parent() {
+        let parent_str = parent.to_string_lossy();
+        if parent_str.ends_with(".claude/skills") || parent_str.ends_with(".claude\\skills") {
+            return p.is_dir();
+        }
+    }
+    false
+}
+
+/// Try to read the description for a skill from .claude-plugin/plugin.json.
+fn read_plugin_description(repo_dir: &Path) -> Option<String> {
+    let plugin_json = repo_dir.join(".claude-plugin/plugin.json");
+    if !plugin_json.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&plugin_json).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract name and description for a skill directory.
+/// Prefers SKILL.md frontmatter; falls back to folder name + plugin.json description.
+fn extract_skill_info(skill_dir: &Path, repo_dir: &Path) -> (String, Option<String>) {
+    let skill_md = skill_dir.join("SKILL.md");
+    if skill_md.exists() {
+        if let Some((name, desc)) = parse_skill_md(&skill_md) {
+            return (name, desc);
+        }
+    }
+    // Fallback: folder name + optional plugin.json description
+    let name = skill_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let desc = read_plugin_description(repo_dir);
+    (name, desc)
+}
+
+fn is_hidden_dir_name(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+fn is_known_root_scan_dir(name: &str) -> bool {
+    SKILL_SCAN_BASES
+        .iter()
+        .filter_map(|base| base.split('/').next())
+        .any(|base| base == name)
+}
+
+fn is_skill_container_dir_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized.contains("skill")
+}
+
+fn push_skill_dirs_from_base(out: &mut Vec<PathBuf>, base_dir: &Path) {
+    if let Ok(rd) = std::fs::read_dir(base_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if is_skill_dir(&p) {
+                out.push(p);
+            }
+        }
+    }
+}
+
+const MAX_SKILL_SCAN_DEPTH: usize = 4;
+
+fn collect_nested_standard_skills(out: &mut Vec<PathBuf>, base: &Path, depth: usize) {
+    if depth == 0 || !std::fs::symlink_metadata(base).is_ok_and(|metadata| metadata.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let known_hidden = depth == MAX_SKILL_SCAN_DEPTH
+            && matches!(name.as_ref(), ".curated" | ".experimental" | ".system");
+        if (is_hidden_dir_name(&name) && !known_hidden)
+            || matches!(name.as_ref(), "node_modules" | "target" | "dist")
+        {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("SKILL.md").is_file() {
+            out.push(path);
+        } else {
+            collect_nested_standard_skills(out, &path, depth - 1);
+        }
+    }
+}
+
+fn collect_skill_dirs(repo_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    collect_nested_standard_skills(&mut out, &repo_dir.join("skills"), MAX_SKILL_SCAN_DEPTH);
+    push_skill_dirs_from_base(&mut out, &repo_dir.join(".claude/skills"));
+
+    // 2) Root-level skills: repo/my-skill/SKILL.md.
+    // 3) Root-level skill containers: repo/*skill*/my-skill/SKILL.md.
+    if let Ok(rd) = std::fs::read_dir(repo_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name();
+            let dir_name = dir_name.to_string_lossy();
+            if is_hidden_dir_name(&dir_name) || is_known_root_scan_dir(&dir_name) {
+                continue;
+            }
+            if p.join("SKILL.md").exists() {
+                out.push(p);
+            } else if is_skill_container_dir_name(&dir_name) {
+                push_skill_dirs_from_base(&mut out, &p);
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Scan all skill candidates in a repo directory, returning (name, relative_subpath) pairs.
+/// Used for auto-matching when updating legacy skills with missing source_subpath.
+fn scan_skill_candidates_in_dir(repo_dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for p in collect_skill_dirs(repo_dir) {
+        let (name, _) = extract_skill_info(&p, repo_dir);
+        let rel = p
+            .strip_prefix(repo_dir)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push((name, rel));
+    }
+    out
+}
+
+/// Count skill directories in a repo: checks both `skills/*` and root-level subdirectories.
+fn count_skills_in_repo(repo_dir: &Path) -> usize {
+    collect_skill_dirs(repo_dir).len()
+}
+
+fn compute_content_hash(path: &Path) -> Option<String> {
+    if should_compute_content_hash() {
+        hash_dir(path).ok()
+    } else {
+        None
+    }
+}
+
+fn should_compute_content_hash() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    std::env::var("SKILLS_HUB_COMPUTE_HASH")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub struct UpdateResult {
+    pub skill_id: String,
+    pub name: String,
+    #[allow(dead_code)]
+    pub central_path: PathBuf,
+    pub content_hash: Option<String>,
+    pub source_revision: Option<String>,
+    pub updated_targets: Vec<String>,
+    pub pending_targets: Vec<String>,
+    pub changed: bool,
+}
+
+pub struct UpdateCheckResult {
+    pub changed: bool,
+    pub removal_count: usize,
+}
+
+fn expected_builtin_target_path(
+    paths: &RuntimePaths,
+    adapter: &super::tool_adapters::ToolAdapter,
+    skill_name: &str,
+    target: &SkillTargetRecord,
+) -> Result<PathBuf> {
+    let root = if target.scope == "project" {
+        let project_path = target
+            .project_path
+            .as_deref()
+            .context("project target is missing its project path")?;
+        PathBuf::from(project_path).join(project_relative_skills_dir(adapter))
+    } else {
+        let home = paths
+            .default_central_repo
+            .parent()
+            .context("missing runtime home")?;
+        resolve_adapter_path_in_home(adapter, home, adapter.relative_skills_dir, "skills")
+    };
+    Ok(root.join(skill_name))
+}
+
+fn sync_mode_key(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Auto => "auto",
+        SyncMode::Symlink => "symlink",
+        SyncMode::Junction => "junction",
+        SyncMode::Copy => "copy",
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdateFileLock(std::fs::File);
+
+impl UpdateFileLock {
+    fn acquire(central_parent: &Path) -> Result<Self> {
+        let lock_path = central_parent.join(".skills-hub-update.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open update lock {:?}", lock_path))?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self(file)),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::bail!("UPDATE_IN_PROGRESS|{}", central_parent.to_string_lossy())
+            }
+            Err(err) => Err(err).with_context(|| format!("lock update repository {:?}", lock_path)),
+        }
+    }
+}
+
+pub(crate) fn acquire_skill_update_lock(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+) -> Result<UpdateFileLock> {
+    let central_root = resolve_central_repo_path(paths, store)?;
+    UpdateFileLock::acquire(&central_root)
+}
+
+impl Drop for UpdateFileLock {
+    fn drop(&mut self) {
+        if let Err(err) = FileExt::unlock(&self.0) {
+            eprintln!("[update] failed to unlock update repository: {err}");
+        }
+    }
+}
+
+pub fn update_managed_skill_from_source(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<UpdateResult> {
+    update_managed_skill_from_source_with_cancel(paths, store, skill_id, None)
+}
+
+pub(crate) fn update_managed_skill_from_source_with_cancel(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+    cancel: Option<&CancelToken>,
+) -> Result<UpdateResult> {
+    ensure_not_cancelled(cancel)?;
+    let _update_lock = acquire_skill_update_lock(paths, store)?;
+    update_managed_skill_with_cancel_and_lock(paths, store, skill_id, false, cancel)
+}
+
+fn ensure_not_cancelled(cancel: Option<&CancelToken>) -> Result<()> {
+    anyhow::ensure!(!cancel.is_some_and(CancelToken::is_cancelled), "CANCELLED|");
+    Ok(())
+}
+
+pub fn check_managed_skill_update(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<UpdateCheckResult> {
+    let _update_lock = acquire_skill_update_lock(paths, store)?;
+    let record = store
+        .get_skill_by_id(skill_id)?
+        .ok_or_else(|| anyhow::anyhow!("skill not found"))?;
+    if record.has_unbound_local_source() {
+        anyhow::bail!("SKILL_SOURCE_UNBOUND|This Skill receives device sync updates; no local source is bound");
+    }
+    let central_path = PathBuf::from(&record.central_path);
+    if !central_path.exists() {
+        anyhow::bail!("central path not found");
+    }
+    let (staging_dir, _, _) = stage_skill_source(paths, store, &record, None)?;
+    let result = (|| {
+        let previous_hash = hash_dir(&central_path)?;
+        let next_hash = hash_dir(&staging_dir)?;
+        Ok(UpdateCheckResult {
+            changed: previous_hash != next_hash,
+            removal_count: count_update_removals(store, &record.id, &central_path, &staging_dir)?,
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdateTargetConflict {
+    pub skill_id: String,
+    pub agent: String,
+    pub path: String,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for UpdateTargetConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("managed update target failed preflight")
+    }
+}
+
+impl std::error::Error for UpdateTargetConflict {}
+
+pub(crate) fn preflight_managed_skill_update_targets(
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<()> {
+    let skill = store
+        .get_skill_by_id(skill_id)?
+        .context("skill not found")?;
+    let source = Path::new(&skill.central_path);
+    let previous_hash = hash_dir_for_sync_conflict(source)?;
+    for target in store.list_skill_targets(skill_id)? {
+        if target.status == "disabled" {
+            continue;
+        }
+        let conflict = |reason| UpdateTargetConflict {
+            skill_id: skill_id.into(),
+            agent: target.tool.clone(),
+            path: target.target_path.clone(),
+            reason,
+        };
+        if target.status != "ok" && target.synced_at.is_none() {
+            return Err(conflict("unmanaged_target").into());
+        }
+        if store.is_target_used_by_other_skill(&target.target_path, skill_id)? {
+            return Err(conflict("target_owned_elsewhere").into());
+        }
+        if target.mode == "copy" {
+            super::tool_distribution::preflight_copy_refresh(
+                store,
+                source,
+                &target,
+                &previous_hash,
+            )
+            .map_err(|error| {
+                conflict(if error.to_string().starts_with("TARGET_MODIFIED|") {
+                    "modified_target"
+                } else {
+                    "unsafe_target"
+                })
+            })?;
+        } else {
+            let path = Path::new(&target.target_path);
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(conflict("unreadable_target").into()),
+                Ok(_) => {}
+            }
+            let link = std::fs::read_link(path).map_err(|_| conflict("modified_target"))?;
+            let resolved = if link.is_absolute() {
+                link
+            } else {
+                path.parent().context("target has no parent")?.join(link)
+            };
+            let expected = super::sync_engine::path_for_comparison(source)?;
+            if super::sync_engine::path_for_comparison(&resolved)
+                .map_err(|_| conflict("modified_target"))?
+                != expected
+            {
+                return Err(conflict("modified_target").into());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn update_managed_skill_from_source_with_lock_held(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+    preserve_newer_managed_content: bool,
+) -> Result<UpdateResult> {
+    update_managed_skill_with_cancel_and_lock(
+        paths,
+        store,
+        skill_id,
+        preserve_newer_managed_content,
+        None,
+    )
+}
+
+fn update_managed_skill_with_cancel_and_lock(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+    preserve_newer_managed_content: bool,
+    cancel: Option<&CancelToken>,
+) -> Result<UpdateResult> {
+    if store
+        .get_skill_by_id(skill_id)?
+        .is_some_and(|skill| skill.has_unbound_local_source())
+    {
+        anyhow::bail!("SKILL_SOURCE_UNBOUND|This Skill receives device sync updates; no local source is bound");
+    }
+    let mut source_updated = false;
+    let result = update_managed_skill_from_source_inner(
+        paths,
+        store,
+        skill_id,
+        preserve_newer_managed_content,
+        &mut source_updated,
+        cancel,
+    );
+    let non_source_failure = result.as_ref().err().is_some_and(|err| {
+        let error = err.to_string();
+        error.starts_with("UPDATE_IN_PROGRESS|")
+            || error.starts_with("UPDATE_HELD_BACK|")
+            || error.starts_with("CANCELLED|")
+    });
+    if result.is_err()
+        && !source_updated
+        && !non_source_failure
+        && store.get_skill_by_id(skill_id)?.is_some()
+    {
+        if let Err(error) = &result {
+            store.record_source_failure(skill_id, &format!("{error:#}"))?;
+        }
+    }
+    result
+}
+
+fn update_managed_skill_from_source_inner(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+    preserve_newer_managed_content: bool,
+    source_updated: &mut bool,
+    cancel: Option<&CancelToken>,
+) -> Result<UpdateResult> {
+    let record = store
+        .get_skill_by_id(skill_id)?
+        .ok_or_else(|| anyhow::anyhow!("skill not found"))?;
+
+    let central_path = PathBuf::from(record.central_path.clone());
+    if !central_path.exists() {
+        anyhow::bail!("central path not found: {:?}", central_path);
+    }
+    let previous_content_hash = hash_dir(&central_path)
+        .with_context(|| format!("hash current central Skill {:?}", central_path))?;
+    let previous_strict_hash = hash_dir_strict(&central_path)
+        .with_context(|| format!("strictly hash current central Skill {:?}", central_path))?;
+    let previous_conflict_hash = hash_dir_for_sync_conflict(&central_path)
+        .with_context(|| format!("hash current central Skill for sync {:?}", central_path))?;
+
+    let now = now_ms();
+    let (staging_dir, new_revision, resolved_source_subpath) =
+        stage_skill_source(paths, store, &record, cancel)?;
+
+    if let Err(error) = ensure_not_cancelled(cancel) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+    let next_content_hash = match hash_dir(&staging_dir)
+        .with_context(|| format!("hash staged central Skill {:?}", staging_dir))
+    {
+        Ok(hash) => hash,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(err);
+        }
+    };
+    let source_baseline = if preserve_newer_managed_content {
+        store.source_baseline(&record.id)?
+    } else {
+        None
+    };
+    let source_is_unchanged = source_baseline.as_ref().map_or_else(
+        || {
+            !(record.source_type == "git"
+                && record
+                    .source_revision
+                    .as_ref()
+                    .zip(new_revision.as_ref())
+                    .is_some_and(|(previous, next)| previous != next))
+        },
+        |baseline| baseline.matches(&record, &next_content_hash),
+    );
+    if preserve_newer_managed_content
+        && previous_content_hash != next_content_hash
+        && source_is_unchanged
+    {
+        let mut checked = record.clone();
+        checked.source_subpath = resolved_source_subpath;
+        checked.source_revision = new_revision.clone().or(record.source_revision.clone());
+        store.record_source_check_success(&checked, next_content_hash)?;
+        std::fs::remove_dir_all(&staging_dir)?;
+        *source_updated = true;
+        return Ok(UpdateResult {
+            skill_id: record.id,
+            name: record.name,
+            central_path,
+            content_hash: Some(previous_content_hash),
+            source_revision: checked.source_revision,
+            updated_targets: Vec::new(),
+            pending_targets: Vec::new(),
+            changed: false,
+        });
+    }
+    let changed = previous_content_hash != next_content_hash;
+    let description = parse_skill_md(&staging_dir.join("SKILL.md"))
+        .and_then(|(_, desc)| desc)
+        .or(record.description.clone());
+
+    let content_hash = Some(next_content_hash);
+
+    let updated = SkillRecord {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        description,
+        source_type: record.source_type.clone(),
+        source_ref: record.source_ref.clone(),
+        source_subpath: resolved_source_subpath,
+        source_revision: new_revision.clone().or(record.source_revision.clone()),
+        central_path: record.central_path.clone(),
+        content_hash: content_hash.clone(),
+        created_at: record.created_at,
+        updated_at: now,
+        last_sync_at: record.last_sync_at,
+        last_seen_at: now,
+        enabled: record.enabled,
+        status: "ok".to_string(),
+    };
+
+    if let Err(error) = ensure_not_cancelled(cancel) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+    if !changed {
+        std::fs::remove_dir_all(&staging_dir)
+            .with_context(|| format!("remove unchanged staged Skill {:?}", staging_dir))?;
+        store.commit_skill_update(&updated, &[])?;
+        *source_updated = true;
+        return Ok(UpdateResult {
+            skill_id: record.id,
+            name: record.name,
+            central_path,
+            content_hash,
+            source_revision: new_revision,
+            updated_targets: Vec::new(),
+            pending_targets: Vec::new(),
+            changed: false,
+        });
+    }
+
+    let mut central_replacement = PreparedDirReplacement::from_staging(
+        staging_dir.clone(),
+        central_path.clone(),
+        Some(previous_strict_hash.clone()),
+        false,
+    )?;
+    ensure_not_cancelled(cancel)?;
+    if let Err(err) = central_replacement.activate() {
+        if err.to_string().starts_with("TARGET_MODIFIED|") {
+            anyhow::bail!("CENTRAL_MODIFIED|{}", central_path.to_string_lossy());
+        }
+        return Err(err);
+    }
+    let central_result = central_replacement
+        .verify_backup_unchanged()
+        .and_then(|_| store.commit_skill_update(&updated, &[]));
+    if let Err(err) = central_result {
+        central_replacement
+            .rollback()
+            .context("rollback central Skill")?;
+        return Err(err).context("commit central Skill update");
+    }
+    central_replacement.commit();
+    *source_updated = true;
+
+    let mut updated_targets = Vec::new();
+    let mut pending_targets = Vec::new();
+    for original in store.list_skill_targets(skill_id)? {
+        if original.status == "disabled" {
+            continue;
+        }
+        if original.scope == "global" {
+            if let Some(adapter) = adapter_by_key(&original.tool) {
+                let home = paths
+                    .default_central_repo
+                    .parent()
+                    .context("missing runtime home")?;
+                if !resolve_adapter_path_in_home(&adapter, home, adapter.relative_detect_dir, "")
+                    .exists()
+                {
+                    continue;
+                }
+            }
+        }
+        let result = (|| -> Result<bool> {
+            let mut target = original.clone();
+            if let Some(adapter) = adapter_by_key(&target.tool) {
+                if adapter.id == ToolId::KimiCli {
+                    let expected =
+                        expected_builtin_target_path(paths, &adapter, &record.name, &target)?;
+                    if Path::new(&target.target_path) != expected {
+                        if std::fs::symlink_metadata(&expected).is_ok() {
+                            let hash = hash_dir_for_sync_conflict(&expected)?;
+                            anyhow::ensure!(
+                                hash == previous_conflict_hash
+                                    || hash == hash_dir_for_sync_conflict(&central_path)?,
+                                "TOOL_SYNC_TARGET_CONFLICT|{}|{}",
+                                adapter.display_name,
+                                expected.display()
+                            );
+                        }
+                        if target.mode != "copy" {
+                            let outcome = sync_dir_for_tool_with_overwrite(
+                                adapter.id.as_key(),
+                                &central_path,
+                                &expected,
+                                false,
+                            )?;
+                            target.mode = sync_mode_key(outcome.mode_used).into();
+                        }
+                        target.target_path = expected.to_string_lossy().into();
+                        store.upsert_skill_target(&target)?;
+                    }
+                }
+            }
+            if target.mode == "copy" {
+                super::tool_distribution::refresh_copy(
+                    store,
+                    skill_id,
+                    &central_path,
+                    Path::new(&target.target_path),
+                    Some(&previous_conflict_hash),
+                )?;
+                return Ok(true);
+            }
+            if target.target_path != original.target_path {
+                target.status = "ok".into();
+                target.last_error = None;
+                target.synced_at = Some(now);
+                store.upsert_skill_target(&target)?;
+                return Ok(true);
+            }
+            Ok(false)
+        })();
+        match result {
+            Ok(true) => updated_targets.push(original.tool),
+            Ok(false) => {}
+            Err(err) => {
+                record_target_sync_failure(store, &original, &format!("{err:#}"))?;
+                pending_targets.push(original.tool);
+            }
+        }
+    }
+    Ok(UpdateResult {
+        skill_id: record.id,
+        name: record.name,
+        central_path,
+        content_hash,
+        source_revision: new_revision,
+        updated_targets,
+        pending_targets,
+        changed: true,
+    })
+}
+
+fn stage_skill_source(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    record: &SkillRecord,
+    cancel: Option<&CancelToken>,
+) -> Result<(PathBuf, Option<String>, Option<String>)> {
+    ensure_not_cancelled(cancel)?;
+    let central_path = PathBuf::from(&record.central_path);
+    let central_parent = central_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid central path"))?;
+    if record.source_type == "bundled" {
+        let conflict = |reason| UpdateTargetConflict {
+            skill_id: record.id.clone(),
+            agent: "library".into(),
+            path: record.central_path.clone(),
+            reason,
+        };
+        anyhow::ensure!(
+            record.name == "manage-skills-hub",
+            conflict("unknown_bundled_skill")
+        );
+        let mut local_record = record.clone();
+        crate::core::device_sync::manifest::recover_bundled_sync_hash(store, &mut local_record)?;
+        let metadata = std::fs::symlink_metadata(&central_path)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && local_record.content_hash.as_ref() == Some(&hash_dir_strict(&central_path)?),
+            conflict("bundled_skill_modified")
+        );
+        preflight_managed_skill_update_targets(store, &record.id)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".skills-hub-update-")
+            .tempdir_in(central_parent)?;
+        std::fs::write(staging.path().join("SKILL.md"), OFFICIAL_SKILL_MD)?;
+        return Ok((staging.keep(), Some(env!("CARGO_PKG_VERSION").into()), None));
+    }
+    let staging_dir = central_parent.join(format!(".skills-hub-update-{}", Uuid::new_v4()));
+    if staging_dir.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+
+    let staged = (|| -> Result<(Option<String>, Option<String>)> {
+        if record.source_type == "git" {
+            let repo_url = record
+                .source_ref
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing source_ref for git skill"))?;
+            let parsed = parse_github_url(repo_url);
+            let stored_subpath = record
+                .source_subpath
+                .as_deref()
+                .map(|path| path.replace('\\', "/"));
+            let (repo_dir, revision) = if let Some(subpath) = stored_subpath.as_deref() {
+                clone_to_cache_subpath(
+                    paths,
+                    store,
+                    &parsed.clone_url,
+                    parsed.branch.as_deref(),
+                    subpath,
+                    cancel,
+                )?
+            } else {
+                clone_to_cache(
+                    paths,
+                    store,
+                    &parsed.clone_url,
+                    parsed.branch.as_deref(),
+                    cancel,
+                )?
+            };
+            let mut resolved_subpath = stored_subpath
+                .as_deref()
+                .or(parsed.subpath.as_deref())
+                .map(str::to_string);
+            if resolved_subpath.is_none() && count_skills_in_repo(&repo_dir) >= 2 {
+                let candidates = scan_skill_candidates_in_dir(&repo_dir);
+                let skill_name = record.name.to_lowercase();
+                if let Some(matched) = candidates
+                    .iter()
+                    .find(|candidate| candidate.0 == record.name)
+                    .or_else(|| {
+                        let fuzzy = candidates
+                            .iter()
+                            .filter(|candidate| {
+                                let candidate_name = candidate.0.to_lowercase();
+                                candidate_name.contains(&skill_name)
+                                    || skill_name.contains(&candidate_name)
+                            })
+                            .collect::<Vec<_>>();
+                        match fuzzy.as_slice() {
+                            [candidate] => Some(*candidate),
+                            _ => None,
+                        }
+                    })
+                {
+                    resolved_subpath = Some(matched.1.clone());
+                } else {
+                    anyhow::bail!("SKILL_SOURCE_SELECTION_REQUIRED");
+                }
+            }
+            let copy_source = resolved_subpath
+                .as_deref()
+                .map_or_else(|| repo_dir.clone(), |subpath| repo_dir.join(subpath));
+            if !copy_source.exists() {
+                anyhow::bail!("path not found in repo");
+            }
+            copy_dir_recursive(&copy_source, &staging_dir).context("stage git skill update")?;
+            Ok((Some(revision), resolved_subpath))
+        } else if record.source_type == "local" {
+            let source = record
+                .source_ref
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing source_ref for local skill"))?;
+            let source_path = PathBuf::from(source);
+            if !source_path.exists() {
+                anyhow::bail!("source path not found");
+            }
+            copy_dir_recursive(&source_path, &staging_dir).context("stage local skill update")?;
+            Ok((None, record.source_subpath.clone()))
+        } else {
+            anyhow::bail!("unsupported source type for update");
+        }
+    })();
+
+    let staged = staged.and_then(|result| {
+        anyhow::ensure!(
+            staging_dir.join("SKILL.md").is_file(),
+            "SKILL_INVALID|missing_skill_md"
+        );
+        Ok(result)
+    });
+    match staged {
+        Ok((revision, subpath)) => Ok((staging_dir, revision, subpath)),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            Err(error)
+        }
+    }
+}
+
+fn count_removed_files(current: &Path, staged: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(current).context("inspect current skill content")? {
+        let entry = entry.context("inspect current skill entry")?;
+        let current_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&current_path)?;
+        if ignored_update_entry(&current_path, &metadata) {
+            continue;
+        }
+        let staged_path = staged.join(entry.file_name());
+        let staged_metadata = std::fs::symlink_metadata(&staged_path).ok();
+        if metadata.is_dir() {
+            if staged_metadata.as_ref().is_some_and(|value| value.is_dir()) {
+                removed += count_removed_files(&current_path, &staged_path)?;
+            } else {
+                removed += count_files(&current_path)?;
+            }
+        } else if match staged_metadata.as_ref() {
+            Some(value) => value.is_dir(),
+            None => true,
+        } {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn count_update_removals(
+    store: &SkillStore,
+    skill_id: &str,
+    central_path: &Path,
+    staged_path: &Path,
+) -> Result<usize> {
+    let mut removal_count = count_removed_files(central_path, staged_path)?;
+    let mut inspected_targets = HashSet::new();
+    for target in store.list_skill_targets(skill_id)? {
+        if target.mode != "copy" || target.status == "disabled" {
+            continue;
+        }
+        let target_path = PathBuf::from(target.target_path);
+        if !target_path.exists() || !inspected_targets.insert(target_path.clone()) {
+            continue;
+        }
+        removal_count += count_removed_files(&target_path, staged_path)?;
+    }
+    Ok(removal_count)
+}
+
+fn count_files(path: &Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(path).context("inspect removed skill directory")? {
+        let entry = entry.context("inspect removed skill entry")?;
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&entry_path)?;
+        if ignored_update_entry(&entry_path, &metadata) {
+            continue;
+        }
+        if metadata.is_dir() {
+            count += count_files(&entry_path)?;
+        } else {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn ignored_update_entry(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    let file_name = path.file_name();
+    file_name == Some(std::ffi::OsStr::new(".git"))
+        || (metadata.is_dir() && file_name == Some(std::ffi::OsStr::new("__pycache__")))
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GitSkillCandidate {
+    pub name: String,
+    pub description: Option<String>,
+    pub subpath: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LocalSkillCandidate {
+    pub name: String,
+    pub description: Option<String>,
+    pub subpath: String,
+    pub valid: bool,
+    pub reason: Option<String>,
+}
+
+pub fn list_git_skills(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    repo_url: &str,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<GitSkillCandidate>> {
+    let parsed = parse_github_url(repo_url);
+    let (repo_dir, _rev) = clone_to_cache_for_subpath(
+        paths,
+        store,
+        &parsed.clone_url,
+        parsed.branch.as_deref(),
+        parsed.subpath.as_deref(),
+        cancel,
+    )?;
+
+    let mut out: Vec<GitSkillCandidate> = Vec::new();
+
+    // If user provided a folder URL, treat it as a single candidate.
+    if let Some(subpath) = &parsed.subpath {
+        let dir = repo_dir.join(subpath);
+        if dir.is_dir() && (dir.join("SKILL.md").exists() || is_claude_skill_dir(&dir)) {
+            let (name, desc) = extract_skill_info(&dir, &repo_dir);
+            out.push(GitSkillCandidate {
+                name,
+                description: desc,
+                subpath: subpath.to_string(),
+            });
+        } else if dir.is_dir() {
+            let mut dirs = Vec::new();
+            if subpath == "skills" {
+                collect_nested_standard_skills(&mut dirs, &dir, MAX_SKILL_SCAN_DEPTH);
+            } else {
+                dirs = collect_skill_dirs(&dir);
+            }
+            for p in dirs {
+                let (name, desc) = extract_skill_info(&p, &repo_dir);
+                let rel = p
+                    .strip_prefix(&repo_dir)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push(GitSkillCandidate {
+                    name,
+                    description: desc,
+                    subpath: rel,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.dedup_by(|a, b| a.subpath == b.subpath);
+        return Ok(out);
+    }
+
+    // Root-level skill
+    let root_skill = repo_dir.join("SKILL.md");
+    if root_skill.exists() {
+        let (name, desc) = parse_skill_md(&root_skill).unwrap_or(("root-skill".to_string(), None));
+        out.push(GitSkillCandidate {
+            name,
+            description: desc,
+            subpath: ".".to_string(),
+        });
+    }
+
+    for p in collect_skill_dirs(&repo_dir) {
+        let (name, desc) = extract_skill_info(&p, &repo_dir);
+        let rel = p
+            .strip_prefix(&repo_dir)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(GitSkillCandidate {
+            name,
+            description: desc,
+            subpath: rel,
+        });
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.subpath == b.subpath);
+
+    Ok(out)
+}
+
+pub fn list_local_skills(base_path: &Path) -> Result<Vec<LocalSkillCandidate>> {
+    if !base_path.exists() {
+        anyhow::bail!("source path not found: {:?}", base_path);
+    }
+
+    let mut out: Vec<LocalSkillCandidate> = Vec::new();
+
+    let root_skill = base_path.join("SKILL.md");
+    if root_skill.exists() {
+        match parse_skill_md_with_reason(&root_skill) {
+            Ok((name, desc)) => {
+                out.push(LocalSkillCandidate {
+                    name,
+                    description: desc,
+                    subpath: ".".to_string(),
+                    valid: true,
+                    reason: None,
+                });
+            }
+            Err(reason) => {
+                let fallback_name = base_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                out.push(LocalSkillCandidate {
+                    name: if fallback_name.is_empty() {
+                        "root-skill".to_string()
+                    } else {
+                        fallback_name
+                    },
+                    description: None,
+                    subpath: ".".to_string(),
+                    valid: false,
+                    reason: Some(reason.to_string()),
+                });
+            }
+        }
+    }
+
+    for base in SKILL_SCAN_BASES {
+        let base_dir = base_path.join(base);
+        if !base_dir.exists() {
+            continue;
+        }
+        if let Ok(rd) = std::fs::read_dir(&base_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let skill_md = p.join("SKILL.md");
+                let rel = p
+                    .strip_prefix(base_path)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string();
+                if skill_md.exists() {
+                    match parse_skill_md_with_reason(&skill_md) {
+                        Ok((name, desc)) => {
+                            out.push(LocalSkillCandidate {
+                                name,
+                                description: desc,
+                                subpath: rel,
+                                valid: true,
+                                reason: None,
+                            });
+                        }
+                        Err(reason) => {
+                            out.push(LocalSkillCandidate {
+                                name: p
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                                description: None,
+                                subpath: rel,
+                                valid: false,
+                                reason: Some(reason.to_string()),
+                            });
+                        }
+                    }
+                } else if is_claude_skill_dir(&p) {
+                    // .claude/skills/* directories are valid without SKILL.md
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let desc = read_plugin_description(base_path);
+                    out.push(LocalSkillCandidate {
+                        name,
+                        description: desc,
+                        subpath: rel,
+                        valid: true,
+                        reason: None,
+                    });
+                } else {
+                    out.push(LocalSkillCandidate {
+                        name: p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        description: None,
+                        subpath: rel,
+                        valid: false,
+                        reason: Some("missing_skill_md".to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    // Also scan root-level directories for skills (matching collect_skill_dirs behavior).
+    // This handles the case where the user selects a directory that directly contains
+    // skill subdirectories (e.g. a "skills" directory with article-writer/SKILL.md).
+    if let Ok(rd) = std::fs::read_dir(base_path) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name();
+            let dir_name = dir_name.to_string_lossy();
+            if is_hidden_dir_name(&dir_name) || is_known_root_scan_dir(&dir_name) {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(base_path)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            if p.join("SKILL.md").exists() {
+                match parse_skill_md_with_reason(&p.join("SKILL.md")) {
+                    Ok((name, desc)) => {
+                        out.push(LocalSkillCandidate {
+                            name,
+                            description: desc,
+                            subpath: rel,
+                            valid: true,
+                            reason: None,
+                        });
+                    }
+                    Err(reason) => {
+                        out.push(LocalSkillCandidate {
+                            name: dir_name.to_string(),
+                            description: None,
+                            subpath: rel,
+                            valid: false,
+                            reason: Some(reason.to_string()),
+                        });
+                    }
+                }
+            } else if is_skill_container_dir_name(&dir_name) {
+                // Scan children of skill container directories.
+                if let Ok(sub_rd) = std::fs::read_dir(&p) {
+                    for sub_entry in sub_rd.flatten() {
+                        let sub_p = sub_entry.path();
+                        if !sub_p.is_dir() {
+                            continue;
+                        }
+                        let sub_rel = sub_p
+                            .strip_prefix(base_path)
+                            .unwrap_or(&sub_p)
+                            .to_string_lossy()
+                            .to_string();
+                        if sub_p.join("SKILL.md").exists() {
+                            match parse_skill_md_with_reason(&sub_p.join("SKILL.md")) {
+                                Ok((name, desc)) => {
+                                    out.push(LocalSkillCandidate {
+                                        name,
+                                        description: desc,
+                                        subpath: sub_rel,
+                                        valid: true,
+                                        reason: None,
+                                    });
+                                }
+                                Err(reason) => {
+                                    out.push(LocalSkillCandidate {
+                                        name: sub_entry.file_name().to_string_lossy().to_string(),
+                                        description: None,
+                                        subpath: sub_rel,
+                                        valid: false,
+                                        reason: Some(reason.to_string()),
+                                    });
+                                }
+                            }
+                        } else if is_claude_skill_dir(&sub_p) {
+                            let name = sub_entry.file_name().to_string_lossy().to_string();
+                            let desc = read_plugin_description(base_path);
+                            out.push(LocalSkillCandidate {
+                                name,
+                                description: desc,
+                                subpath: sub_rel,
+                                valid: true,
+                                reason: None,
+                            });
+                        } else {
+                            out.push(LocalSkillCandidate {
+                                name: sub_entry.file_name().to_string_lossy().to_string(),
+                                description: None,
+                                subpath: sub_rel,
+                                valid: false,
+                                reason: Some("missing_skill_md".to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.subpath == b.subpath);
+
+    Ok(out)
+}
+
+pub(crate) fn git_skill_candidate_from_selection(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    reference: &str,
+    subpath: &str,
+    cancel: Option<&CancelToken>,
+) -> Result<GitSkillCandidate> {
+    let parsed = parse_github_url(reference);
+    let (repo_dir, _) = clone_to_cache_for_subpath(
+        paths,
+        store,
+        &parsed.clone_url,
+        parsed.branch.as_deref(),
+        Some(subpath),
+        cancel,
+    )?;
+    let selected = repo_dir.join(subpath);
+    anyhow::ensure!(
+        selected
+            .canonicalize()?
+            .starts_with(repo_dir.canonicalize()?),
+        "path not found in repo"
+    );
+    ensure_installable_skill_dir(&selected)?;
+    let (name, description) = extract_skill_info(&selected, &repo_dir);
+    let normalized = Path::new(subpath)
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect::<PathBuf>();
+    let subpath = if normalized.as_os_str().is_empty() {
+        ".".into()
+    } else {
+        normalized.to_string_lossy().replace('\\', "/")
+    };
+    Ok(GitSkillCandidate {
+        name,
+        description,
+        subpath,
+    })
+}
+
+pub(crate) fn git_install_content_is_unmodified(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    record: &SkillRecord,
+    cancel: Option<&CancelToken>,
+) -> Result<bool> {
+    let current = Path::new(&record.central_path);
+    if let Some(expected) = &record.content_hash {
+        return Ok(hash_dir(current)? == *expected);
+    }
+    let Some(revision) = record.source_revision.as_deref() else {
+        return Ok(false);
+    };
+    let Some(reference) = record.source_ref.as_deref() else {
+        return Ok(false);
+    };
+    let parsed = parse_github_url(reference);
+    let (repo_dir, _) = clone_to_cache_for_subpath(
+        paths,
+        store,
+        &parsed.clone_url,
+        parsed.branch.as_deref(),
+        record
+            .source_subpath
+            .as_deref()
+            .or(parsed.subpath.as_deref()),
+        cancel,
+    )?;
+    let repo = git2::Repository::open(repo_dir)?;
+    let Some(commit) = git2::Oid::from_str(revision)
+        .ok()
+        .and_then(|oid| repo.find_commit(oid).ok())
+    else {
+        return Ok(false);
+    };
+    let tree = commit.tree()?;
+    let subpath = record
+        .source_subpath
+        .as_deref()
+        .or(parsed.subpath.as_deref())
+        .unwrap_or(".");
+    let object = if subpath == "." {
+        tree.into_object()
+    } else {
+        repo.find_object(
+            tree.get_path(Path::new(subpath))?.id(),
+            Some(git2::ObjectType::Tree),
+        )?
+    };
+    let snapshot = tempfile::tempdir()?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout
+        .target_dir(snapshot.path())
+        .force()
+        .update_index(false);
+    repo.checkout_tree(&object, Some(&mut checkout))?;
+    let comparison = tempfile::tempdir()?;
+    let baseline = comparison.path().join("baseline");
+    let installed = comparison.path().join("installed");
+    copy_dir_recursive(snapshot.path(), &baseline)?;
+    copy_dir_recursive(current, &installed)?;
+    if subpath == "." {
+        for directory in [&baseline, &installed] {
+            let metadata = directory.join(".skills-hub-cache.json");
+            if metadata.is_file() {
+                std::fs::remove_file(metadata)?;
+            }
+        }
+    }
+    Ok(hash_dir(&baseline)? == hash_dir(&installed)?)
+}
+
+pub fn install_git_skill_from_selection(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    repo_url: &str,
+    subpath: &str,
+    name: Option<String>,
+    cancel: Option<&CancelToken>,
+) -> Result<InstallResult> {
+    install_git_skill_from_selection_at_revision(
+        paths, store, repo_url, subpath, name, cancel, None,
+    )
+}
+
+pub fn install_git_skill_from_selection_at_revision(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    repo_url: &str,
+    subpath: &str,
+    name: Option<String>,
+    cancel: Option<&CancelToken>,
+    revision: Option<&str>,
+) -> Result<InstallResult> {
+    let normalized_subpath = subpath.replace('\\', "/");
+    let subpath = normalized_subpath.as_str();
+    let parsed = parse_github_url(repo_url);
+    let user_provided_name = name.is_some();
+    let mut display_name = name.unwrap_or_else(|| {
+        if subpath == "." {
+            derive_name_from_repo_url(&parsed.clone_url)
+        } else {
+            subpath
+                .rsplit('/')
+                .next()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| derive_name_from_repo_url(&parsed.clone_url))
+        }
+    });
+
+    let central_dir = resolve_central_repo_path(paths, store)?;
+    ensure_central_repo(&central_dir)?;
+    let mut central_path = central_dir.join(&display_name);
+    if central_path.exists() {
+        return Err(SkillAlreadyExistsError::new(central_path).into());
+    }
+
+    let (repo_dir, revision) = clone_to_cache_for_subpath(
+        paths,
+        store,
+        &parsed.clone_url,
+        revision.or(parsed.branch.as_deref()),
+        Some(subpath),
+        cancel,
+    )?;
+
+    let copy_src = if subpath == "." {
+        repo_dir.clone()
+    } else {
+        repo_dir.join(subpath)
+    };
+    if !copy_src.exists() {
+        anyhow::bail!("path not found in repo: {:?}", copy_src);
+    }
+    ensure_installable_skill_dir(&copy_src)?;
+
+    copy_dir_recursive(&copy_src, &central_path)
+        .with_context(|| format!("copy {:?} -> {:?}", copy_src, central_path))?;
+
+    // Prefer name from SKILL.md over derived name (fixes #28).
+    let (mut description, md_name) = match parse_skill_md(&central_path.join("SKILL.md")) {
+        Some((n, d)) => (d, Some(n)),
+        None => (None, None),
+    };
+    if !user_provided_name {
+        if let Some(ref better_name) = md_name {
+            if *better_name != display_name {
+                let new_central = central_dir.join(better_name);
+                if !new_central.exists() {
+                    std::fs::rename(&central_path, &new_central).with_context(|| {
+                        format!("rename {:?} -> {:?}", central_path, new_central)
+                    })?;
+                    display_name = better_name.clone();
+                    central_path = new_central;
+                    description =
+                        parse_skill_md(&central_path.join("SKILL.md")).and_then(|(_, d)| d);
+                }
+            }
+        }
+    }
+
+    let now = now_ms();
+    let content_hash = Some(hash_dir(&central_path)?);
+    let source_subpath = if subpath == "." {
+        None
+    } else {
+        Some(subpath.to_string())
+    };
+    let record = SkillRecord {
+        id: Uuid::new_v4().to_string(),
+        name: display_name,
+        description,
+        source_type: "git".to_string(),
+        source_ref: Some(repo_url.to_string()),
+        source_subpath,
+        source_revision: Some(revision),
+        central_path: central_path.to_string_lossy().to_string(),
+        content_hash: content_hash.clone(),
+        created_at: now,
+        updated_at: now,
+        last_sync_at: None,
+        last_seen_at: now,
+        enabled: true,
+        status: "ok".to_string(),
+    };
+    store.commit_skill_update(&record, &[])?;
+
+    Ok(InstallResult {
+        skill_id: record.id,
+        name: record.name,
+        central_path,
+        content_hash,
+    })
+}
+
+pub fn install_local_skill_from_selection(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    base_path: &Path,
+    subpath: &str,
+    name: Option<String>,
+) -> Result<InstallResult> {
+    if !base_path.exists() {
+        anyhow::bail!("source path not found: {:?}", base_path);
+    }
+
+    let selected_dir = if subpath == "." {
+        base_path.to_path_buf()
+    } else {
+        base_path.join(subpath)
+    };
+    if !selected_dir.exists() {
+        anyhow::bail!("source path not found: {:?}", selected_dir);
+    }
+
+    let skill_md = selected_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        anyhow::bail!("SKILL_INVALID|missing_skill_md");
+    }
+    let (parsed_name, _desc) = parse_skill_md_with_reason(&skill_md)
+        .map_err(|reason| anyhow::anyhow!("SKILL_INVALID|{}", reason))?;
+
+    let display_name = name.unwrap_or(parsed_name);
+
+    install_local_skill(paths, store, &selected_dir, Some(display_name))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RepoCacheMeta {
+    last_fetched_ms: i64,
+    head: Option<String>,
+}
+
+static GIT_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+// Keep discovery, selection validation, and installation scoped to the same source.
+// A full checkout can fail on unrelated LFS assets even when the Skill is ordinary text.
+fn clone_to_cache_for_subpath(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    clone_url: &str,
+    branch: Option<&str>,
+    subpath: Option<&str>,
+    cancel: Option<&CancelToken>,
+) -> Result<(PathBuf, String)> {
+    if let Some(subpath) = subpath.filter(|path| *path != ".") {
+        if super::git_fetcher::system_git_available() {
+            return clone_to_cache_subpath(paths, store, clone_url, branch, subpath, cancel);
+        }
+    }
+    // Preserve support for installations that only have the built-in Git implementation.
+    clone_to_cache(paths, store, clone_url, branch, cancel)
+}
+
+fn clone_to_cache(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    clone_url: &str,
+    branch: Option<&str>,
+    cancel: Option<&CancelToken>,
+) -> Result<(PathBuf, String)> {
+    let started = std::time::Instant::now();
+    let cache_root = &paths.git_cache_dir;
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("failed to create cache dir {:?}", cache_root))?;
+
+    let repo_dir = cache_root.join(repo_cache_key(clone_url, branch, None));
+    let meta_path = repo_dir.join(".skills-hub-cache.json");
+
+    let lock = GIT_CACHE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+
+    if repo_dir.join(".git").exists() {
+        if let Ok(meta) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<RepoCacheMeta>(&meta) {
+                if let Some(head) = meta.head {
+                    let ttl_ms = get_git_cache_ttl_secs(store).saturating_mul(1000);
+                    if ttl_ms > 0 && now_ms().saturating_sub(meta.last_fetched_ms) < ttl_ms {
+                        log::info!(
+                            "[installer] git cache hit (fresh) {}s url={} branch={:?} repo_dir={:?}",
+                            started.elapsed().as_secs_f32(),
+                            clone_url,
+                            branch,
+                            repo_dir
+                        );
+                        return Ok((repo_dir, head));
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "[installer] git cache miss/stale; fetching {} url={} branch={:?} repo_dir={:?}",
+        started.elapsed().as_secs_f32(),
+        clone_url,
+        branch,
+        repo_dir
+    );
+
+    let proxy_url = get_github_proxy_url(store)?;
+    let rev = match clone_or_pull(clone_url, &repo_dir, branch, cancel, Some(&proxy_url)) {
+        Ok(rev) => rev,
+        Err(err) => {
+            // If cache got corrupted, retry once from a clean state.
+            if repo_dir.exists() {
+                let _ = std::fs::remove_dir_all(&repo_dir);
+            }
+            clone_or_pull(clone_url, &repo_dir, branch, cancel, Some(&proxy_url))
+                .with_context(|| format!("{:#}", err))?
+        }
+    };
+
+    let _ = std::fs::write(
+        &meta_path,
+        serde_json::to_string(&RepoCacheMeta {
+            last_fetched_ms: now_ms(),
+            head: Some(rev.clone()),
+        })
+        .unwrap_or_else(|_| "{}".to_string()),
+    );
+
+    log::info!(
+        "[installer] git cache ready {}s url={} branch={:?} head={}",
+        started.elapsed().as_secs_f32(),
+        clone_url,
+        branch,
+        rev
+    );
+    Ok((repo_dir, rev))
+}
+
+fn clone_to_cache_subpath(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+    clone_url: &str,
+    branch: Option<&str>,
+    subpath: &str,
+    cancel: Option<&CancelToken>,
+) -> Result<(PathBuf, String)> {
+    let normalized_subpath = subpath.replace('\\', "/");
+    let subpath = normalized_subpath.as_str();
+    let started = std::time::Instant::now();
+    let cache_root = &paths.git_cache_dir;
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("failed to create cache dir {:?}", cache_root))?;
+
+    let repo_dir = cache_root.join(repo_cache_key(clone_url, branch, Some(subpath)));
+    let meta_path = repo_dir.join(".skills-hub-cache.json");
+
+    let lock = GIT_CACHE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+
+    if repo_dir.join(".git").exists() && repo_dir.join(subpath).is_dir() {
+        if let Ok(meta) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<RepoCacheMeta>(&meta) {
+                if let Some(head) = meta.head {
+                    let ttl_ms = get_git_cache_ttl_secs(store).saturating_mul(1000);
+                    if ttl_ms > 0 && now_ms().saturating_sub(meta.last_fetched_ms) < ttl_ms {
+                        log::info!(
+                            "[installer] sparse git cache hit (fresh) {}s url={} branch={:?} subpath={} repo_dir={:?}",
+                            started.elapsed().as_secs_f32(),
+                            clone_url,
+                            branch,
+                            subpath,
+                            repo_dir
+                        );
+                        return Ok((repo_dir, head));
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "[installer] sparse git cache miss/stale; fetching {} url={} branch={:?} subpath={} repo_dir={:?}",
+        started.elapsed().as_secs_f32(),
+        clone_url,
+        branch,
+        subpath,
+        repo_dir
+    );
+
+    let proxy_url = get_github_proxy_url(store)?;
+    let rev = match clone_or_pull_sparse(
+        clone_url,
+        &repo_dir,
+        branch,
+        subpath,
+        cancel,
+        Some(&proxy_url),
+    ) {
+        Ok(rev) => rev,
+        Err(err) => {
+            if repo_dir.exists() {
+                let _ = std::fs::remove_dir_all(&repo_dir);
+            }
+            clone_or_pull_sparse(
+                clone_url,
+                &repo_dir,
+                branch,
+                subpath,
+                cancel,
+                Some(&proxy_url),
+            )
+            .with_context(|| format!("{:#}", err))?
+        }
+    };
+
+    let _ = std::fs::write(
+        &meta_path,
+        serde_json::to_string(&RepoCacheMeta {
+            last_fetched_ms: now_ms(),
+            head: Some(rev.clone()),
+        })
+        .unwrap_or_else(|_| "{}".to_string()),
+    );
+
+    log::info!(
+        "[installer] sparse git cache ready {}s url={} branch={:?} subpath={} head={}",
+        started.elapsed().as_secs_f32(),
+        clone_url,
+        branch,
+        subpath,
+        rev
+    );
+    Ok((repo_dir, rev))
+}
+
+fn repo_cache_key(clone_url: &str, branch: Option<&str>, subpath: Option<&str>) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(clone_url.as_bytes());
+    hasher.update(b"\n");
+    if let Some(b) = branch {
+        hasher.update(b.as_bytes());
+    }
+    hasher.update(b"\n");
+    if let Some(s) = subpath {
+        hasher.update(s.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Backfill description for skills from SKILL.md.
+pub fn backfill_skill_descriptions(store: &SkillStore) {
+    let skills = match store.list_skills() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for skill in skills {
+        let central = std::path::Path::new(&skill.central_path);
+        let skill_md = central.join("SKILL.md");
+        if let Some((_, Some(desc))) = parse_skill_md(&skill_md) {
+            if skill.description.as_deref() != Some(desc.as_str()) {
+                let _ = store.update_skill_description(&skill.id, Some(&desc));
+            }
+        }
+    }
+}
+
+pub(crate) fn parse_skill_md(path: &Path) -> Option<(String, Option<String>)> {
+    parse_skill_md_with_reason(path).ok()
+}
+
+fn parse_skill_md_with_reason(path: &Path) -> Result<(String, Option<String>), &'static str> {
+    let text = std::fs::read_to_string(path).map_err(|_| "read_failed")?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.first().map(|v| v.trim()) != Some("---") {
+        return Err("invalid_frontmatter");
+    }
+    let mut name: Option<String> = None;
+    let mut desc: Option<String> = None;
+    let mut found_end = false;
+    let mut i = 1usize;
+    while i < lines.len() {
+        let raw = lines[i];
+        let l = raw.trim();
+        if l == "---" {
+            found_end = true;
+            break;
+        }
+        if let Some(v) = l.strip_prefix("name:") {
+            name = Some(clean_frontmatter_value(v));
+        } else if let Some(v) = l.strip_prefix("description:") {
+            let v = v.trim();
+            if let Some(block_style) = frontmatter_block_style(v) {
+                let folded = block_style == '>';
+                let mut block_lines: Vec<String> = Vec::new();
+                while i + 1 < lines.len() {
+                    let next = lines[i + 1];
+                    if next.trim() == "---" {
+                        break;
+                    }
+                    if !next.trim().is_empty() && !next.starts_with(char::is_whitespace) {
+                        break;
+                    }
+                    block_lines.push(next.strip_prefix("  ").unwrap_or(next).to_string());
+                    i += 1;
+                }
+                let value = if folded {
+                    block_lines
+                        .iter()
+                        .map(|line| line.trim())
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    block_lines.join("\n").trim().to_string()
+                };
+                desc = Some(value);
+            } else {
+                desc = Some(clean_frontmatter_value(v));
+            }
+        }
+        i += 1;
+    }
+    if !found_end {
+        return Err("invalid_frontmatter");
+    }
+    let name = name.ok_or("missing_name")?;
+    Ok((name, desc))
+}
+
+fn clean_frontmatter_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn frontmatter_block_style(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    let style = chars.next()?;
+    if style != '|' && style != '>' {
+        return None;
+    }
+    match chars.next() {
+        None => Some(style),
+        Some('-' | '+') if chars.next().is_none() => Some(style),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/installer.rs"]
+mod tests;
